@@ -611,7 +611,7 @@ mod tests {
 
     #[test]
     fn truncate_reserved_buffer_to_zero() {
-        // 25 intentionally multiple of message length 
+        // 25 intentionally multiple of message length
         let (mut writer, mut reader) = bip_buffer_from(vec![0u8; 25].into_boxed_slice());
         let sender = std::thread::spawn(move || {
             for _round in 0..1024 {
@@ -641,8 +641,238 @@ mod tests {
 
     #[test]
     fn set_manual_send_of_reservation() {
-        // 25 intentionally multiple of message length 
+        // 25 intentionally multiple of message length
         let (mut writer, mut reader) = bip_buffer_from(vec![0u8; 25].into_boxed_slice());
+        let sender = std::thread::spawn(move || {
+            for _round in 0..1024 {
+                for i in 0..128 {
+                    let mut reservation = writer.spin_reserve(5);
+                    reservation.set_manual_send();
+                    reservation.copy_from_slice(&[10, 11, 12, 13, i]);
+                    if i % 2 != 0 {
+                        reservation.send();
+                    }
+                }
+            }
+        });
+        let receiver = std::thread::spawn(move || {
+            for _round in 0..1024 {
+                for i in 0..128 {
+                    if i % 2 != 0 {
+                        while reader.valid().len() < 5 {}
+                        assert_eq!(&reader.valid()[..5], &[10, 11, 12, 13, i]);
+                        reader.consume(5);
+                    }
+                }
+            }
+        });
+        sender.join().unwrap();
+        receiver.join().unwrap();
+    }
+
+    #[test]
+    fn basic_u64() {
+        for i in 0..128 {
+            let (mut writer, mut reader) = bip_buffer_from(vec![0u64; 16].into_boxed_slice());
+            let sender = std::thread::spawn(move || {
+                writer.reserve(8).as_mut().expect("reserve").copy_from_slice(&[10, 11, 12, 13, 14, 15, 16, i]);
+            });
+            let receiver = std::thread::spawn(move || {
+                while reader.valid().len() < 8 {}
+                assert_eq!(reader.valid(), &[10, 11, 12, 13, 14, 15, 16, i]);
+                reader.consume(8);
+            });
+            sender.join().unwrap();
+            receiver.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn spsc_u64() {
+        let (mut writer, mut reader) = bip_buffer_from(vec![0u64; 256].into_boxed_slice());
+        let sender = std::thread::spawn(move || {
+            for i in 0..128 {
+                writer.spin_reserve(8).copy_from_slice(&[10, 11, 12, 13, 14, 15, 16, i]);
+            }
+        });
+        let receiver = std::thread::spawn(move || {
+            for i in 0..128 {
+                while reader.valid().len() < 8 {}
+                assert_eq!(&reader.valid()[..8], &[10, 11, 12, 13, 14, 15, 16, i]);
+                reader.consume(8);
+            }
+        });
+        sender.join().unwrap();
+        receiver.join().unwrap();
+    }
+
+    #[test]
+    fn provided_storage_u64() {
+        let storage = vec![0u64; 256].into_boxed_slice();
+        let (mut writer, mut reader) = bip_buffer_from(storage);
+        let sender = std::thread::spawn(move || {
+            writer.spin_reserve(8).copy_from_slice(&[10, 11, 12, 13, 14, 15, 16, 17]);
+        });
+        let receiver = std::thread::spawn(move || {
+            while reader.valid().len() < 8 {}
+            reader.consume(8);
+            reader
+        });
+        sender.join().unwrap();
+        let reader = receiver.join().unwrap();
+        let _: Box<[u64]> = reader.try_unwrap().map_err(|_| ()).expect("failed to recover storage");
+    }
+
+    #[test]
+    #[should_panic]
+    fn provided_storage_wrong_type_u64() {
+        let storage = vec![0u64; 256].into_boxed_slice();
+        let (writer, reader) = bip_buffer_from(storage);
+        std::mem::drop(writer);
+        let _: Vec<u64> = reader.try_unwrap().map_err(|_| ()).expect("failed to recover storage");
+    }
+
+    #[test]
+    fn provided_storage_still_alive_u64() {
+        let storage = vec![0u64; 256].into_boxed_slice();
+        let (writer, reader) = bip_buffer_from(storage);
+        let result: Result<Box<[u64]>, _> = reader.try_unwrap();
+        assert!(result.is_err());
+        std::mem::drop(writer);
+    }
+
+    #[test]
+    fn static_prime_length_64() {
+        const MSG_LENGTH: u8 = 17; // intentionally prime
+        let (mut writer, mut reader) = bip_buffer_from(vec![128u64; 64].into_boxed_slice());
+        let sender = std::thread::spawn(move || {
+            let mut msg = [0u64; MSG_LENGTH as usize];
+            for _ in 0..1024 {
+                for i in 0..128u64 {
+                    &mut msg[..].copy_from_slice(&[i; MSG_LENGTH as usize][..]);
+                    msg[i as usize % (MSG_LENGTH as usize)] = 0;
+                    writer.spin_reserve(MSG_LENGTH as usize).copy_from_slice(&msg[..]);
+                }
+            }
+        });
+        let receiver = std::thread::spawn(move || {
+            let mut msg = [0u64; MSG_LENGTH as usize];
+            for _ in 0..1024 {
+                for i in 0..128u64 {
+                    &mut msg[..].copy_from_slice(&[i; MSG_LENGTH as usize][..]);
+                    msg[i as usize % (MSG_LENGTH as usize)] = 0;
+                    while reader.valid().len() < (MSG_LENGTH as usize) {}
+                    assert_eq!(&reader.valid()[..MSG_LENGTH as usize], &msg[..]);
+                    assert!(reader.consume(MSG_LENGTH as usize));
+                }
+            }
+        });
+        sender.join().unwrap();
+        receiver.join().unwrap();
+    }
+
+    #[test]
+    fn random_length_u64() {
+        use rand::Rng;
+
+        const MAX_LENGTH: usize = 127;
+        let (mut writer, mut reader) = bip_buffer_from(vec![0u64; 1024]);
+        let sender = std::thread::spawn(move || {
+            let mut rng = rand::thread_rng();
+            let mut msg = [0u64; MAX_LENGTH];
+            for _ in 0..1024 {
+                for round in 0..128u64 {
+                    let length: u64 = rng.gen_range(1, MAX_LENGTH as u64);
+                    msg[0] = length;
+                    for i in 1..length {
+                        msg[i as usize] = round;
+                    }
+                    writer.spin_reserve(length as usize).copy_from_slice(&msg[..length as usize]);
+                }
+            }
+        });
+        let receiver = std::thread::spawn(move || {
+            let mut msg = [0u64; MAX_LENGTH];
+            for _ in 0..1024 {
+                for round in 0..128u64 {
+                    let msg_len = loop {
+                        let valid = reader.valid();
+                        if valid.len() < 1 { continue; }
+                        break valid[0] as usize;
+                    };
+                    let recv_msg = loop {
+                        let valid = reader.valid();
+                        if valid.len() < msg_len { continue; }
+                        break valid;
+                    };
+                    msg[0] = msg_len as u64;
+                    for i in 1..msg_len {
+                        msg[i as usize] = round;
+                    }
+                    assert_eq!(&recv_msg[..msg_len], &msg[..msg_len]);
+                    assert!(reader.consume(msg_len as usize));
+                }
+            }
+        });
+        sender.join().unwrap();
+        receiver.join().unwrap();
+    }
+
+    #[test]
+    fn truncate_reserved_buffer_u64() {
+        let (mut writer, mut reader) = bip_buffer_from(vec![0u64; 256].into_boxed_slice());
+        let sender = std::thread::spawn(move || {
+            for i in 0..128 {
+                let mut reservation = writer.spin_reserve(8);
+                reservation[..5].copy_from_slice(&[10, 11, 12, 13, i]);
+                reservation.truncate(5);
+            }
+        });
+        let receiver = std::thread::spawn(move || {
+            for i in 0..128 {
+                while reader.valid().len() < 5 {}
+                assert_eq!(&reader.valid()[..5], &[10, 11, 12, 13, i]);
+                reader.consume(5);
+            }
+        });
+        sender.join().unwrap();
+        receiver.join().unwrap();
+    }
+
+    #[test]
+    fn truncate_reserved_buffer_to_zero_u64() {
+        // 25 intentionally multiple of message length
+        let (mut writer, mut reader) = bip_buffer_from(vec![0u64; 25].into_boxed_slice());
+        let sender = std::thread::spawn(move || {
+            for _round in 0..1024 {
+                for i in 0..128 {
+                    let mut reservation = writer.spin_reserve(5);
+                    reservation.copy_from_slice(&[10, 11, 12, 13, i]);
+                    if i % 2 == 0 {
+                        reservation.cancel();
+                    }
+                }
+            }
+        });
+        let receiver = std::thread::spawn(move || {
+            for _round in 0..1024 {
+                for i in 0..128 {
+                    if i % 2 != 0 {
+                        while reader.valid().len() < 5 {}
+                        assert_eq!(&reader.valid()[..5], &[10, 11, 12, 13, i]);
+                        reader.consume(5);
+                    }
+                }
+            }
+        });
+        sender.join().unwrap();
+        receiver.join().unwrap();
+    }
+
+    #[test]
+    fn set_manual_send_of_reservation_u64() {
+        // 25 intentionally multiple of message length
+        let (mut writer, mut reader) = bip_buffer_from(vec![0u64; 25].into_boxed_slice());
         let sender = std::thread::spawn(move || {
             for _round in 0..1024 {
                 for i in 0..128 {
